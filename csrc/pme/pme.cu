@@ -487,9 +487,19 @@ static torch::autograd::variable_list backward(torch::autograd::AutogradContext*
         int GRID_SIZE = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
         // 2. Set rank-dependent pointers
+        // Expanded (adjoint) sources: used for spreading onto the backward grid.
+        // They encode g_energy * (forward multipole) + (field-output adjoint source).
         const scalar_t* q_ptr = q_expand.data_ptr<scalar_t>();
         const scalar_t* p_ptr = ( rank >= 1 ) ? p_expand.data_ptr<scalar_t>() : nullptr;
         const scalar_t* t_ptr = ( rank >= 2 ) ? t_expand.data_ptr<scalar_t>() : nullptr;
+
+        // Original (forward) multipoles: used in the interpolation force term where the
+        // forward multipoles interact with the adjoint (backward) potential grid. The
+        // g_energy scaling is already contained in the backward grid via q_expand, so the
+        // force term must use the *unscaled* forward multipoles to stay linear in g_energy.
+        const scalar_t* q_fwd_ptr = q.data_ptr<scalar_t>();
+        const scalar_t* p_fwd_ptr = ( rank >= 1 ) ? p.data_ptr<scalar_t>() : nullptr;
+        const scalar_t* t_fwd_ptr = ( rank >= 2 ) ? t.data_ptr<scalar_t>() : nullptr;
 
         // 3. Spread charges / multipoles
         if (rank == 0) {
@@ -542,17 +552,17 @@ static torch::autograd::variable_list backward(torch::autograd::AutogradContext*
         scalar_t* grid_Phi_ptr_forward = saved[8].data_ptr<scalar_t>();
         if (rank == 0) {
             interpolate_kernel_with_field<scalar_t, 0><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
-                grid_Phi_ptr_backward, grid_Phi_ptr_forward, coords_ptr, box_ptr, q_ptr, p_ptr, t_ptr,
+                grid_Phi_ptr_backward, grid_Phi_ptr_forward, coords_ptr, box_ptr, q_fwd_ptr, p_fwd_ptr, t_fwd_ptr,
                 grad_outputs[1].data_ptr<scalar_t>(), grad_outputs[2].data_ptr<scalar_t>(),
                 q_grad_ptr, p_grad_ptr, t_grad_ptr, coords_grad_ptr, alpha_val, N, K1, K2, K3);
         } else if (rank == 1) {
             interpolate_kernel_with_field<scalar_t, 1><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
-                grid_Phi_ptr_backward, grid_Phi_ptr_forward, coords_ptr, box_ptr, q_ptr, p_ptr, t_ptr,
+                grid_Phi_ptr_backward, grid_Phi_ptr_forward, coords_ptr, box_ptr, q_fwd_ptr, p_fwd_ptr, t_fwd_ptr,
                 grad_outputs[1].data_ptr<scalar_t>(), grad_outputs[2].data_ptr<scalar_t>(),
                 q_grad_ptr, p_grad_ptr, t_grad_ptr, coords_grad_ptr, alpha_val, N, K1, K2, K3);
         } else {
             interpolate_kernel_with_field<scalar_t, 2><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
-                grid_Phi_ptr_backward, grid_Phi_ptr_forward, coords_ptr, box_ptr, q_ptr, p_ptr, t_ptr,
+                grid_Phi_ptr_backward, grid_Phi_ptr_forward, coords_ptr, box_ptr, q_fwd_ptr, p_fwd_ptr, t_fwd_ptr,
                 grad_outputs[1].data_ptr<scalar_t>(), grad_outputs[2].data_ptr<scalar_t>(),
                 q_grad_ptr, p_grad_ptr, t_grad_ptr, coords_grad_ptr, alpha_val, N, K1, K2, K3);
         }

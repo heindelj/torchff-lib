@@ -96,7 +96,7 @@ def test_pme_with_field_simple(device, dtype, rank):
     coords, box, q, p, t, alpha, max_hkl = create_test_data(N, rank, device=device, dtype=dtype)
     coords.requires_grad_(True)
 
-    pme_ref = PME(alpha, max_hkl, rank, use_customized_ops=True, return_fields=True).to(
+    pme_ref = PME(alpha, max_hkl, rank, use_customized_ops=False, return_fields=True).to(
         device=device, dtype=dtype
     )
     pme = PME(alpha, max_hkl, rank, use_customized_ops=True, return_fields=True).to(
@@ -122,6 +122,53 @@ def test_pme_with_field_simple(device, dtype, rank):
         ref_func,
         {"coords": coords, "box": box, "q": q, "p": p, "t": t},
         check_grad=True,
+        atol=1e-5,
+        rtol=0.0,
+        verbose=True,
+    )
+
+
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float64)])
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_pme_all_field_grad(device, dtype, rank):
+    """Validate ``pme_long_range_all`` (return_fields=True) gradients vs the Python reference.
+
+    This mirrors how the AMOEBA model consumes PME: it backpropagates through a
+    *scaled* energy (so the upstream grad ``g_energy`` differs from 1, e.g. the
+    Coulomb prefactor ~138.9) together with a field-dependent (polarization-like)
+    term. The previous ``test_pme_with_field_simple`` compared the customized op
+    against itself and only used the field outputs, so it could not catch a bug in
+    the coordinate-gradient term that is quadratic in ``g_energy``.
+    """
+    N = 300
+    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, rank, device=device, dtype=dtype)
+
+    pme_ref = PME(alpha, max_hkl, rank, use_customized_ops=False, return_fields=True).to(
+        device=device, dtype=dtype
+    )
+    pme = PME(alpha, max_hkl, rank, use_customized_ops=True, return_fields=True).to(
+        device=device, dtype=dtype
+    )
+
+    # Coulomb-like prefactor so the upstream gradient on the energy output != 1.
+    K_E = 138.935456
+
+    def make_loss(module):
+        def loss_fn(coords, box, q, p, t):
+            energy, pot, field = module(coords, box, q, p, t)
+            loss = K_E * energy
+            if rank >= 1:
+                loss = loss + 0.5 * torch.sum(field * field)
+            return loss
+        return loss_fn
+
+    check_op(
+        make_loss(pme),
+        make_loss(pme_ref),
+        {"coords": coords, "box": box, "q": q, "p": p, "t": t},
+        check_grad=True,
+        atol=1e-5,
+        rtol=1e-5,
         verbose=True,
     )
 

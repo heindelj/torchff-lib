@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <vector>
+#include <cmath>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -12,13 +13,16 @@
 #include "common/pbc.cuh"
 #include "common/reduce.cuh"
 #include "common/dispatch.cuh"
+#include "common/vdw_taper.cuh"
 
 
 template <typename scalar_t, bool USE_LJ=true>
 __device__ __forceinline__ void vdw_pairwise_kernel(
     scalar_t& drx, scalar_t& dry, scalar_t& drz, scalar_t& dr, 
     scalar_t& sigma_ij, scalar_t& epsilon_ij,
-    scalar_t* ene, scalar_t* dr_grad, scalar_t* sigma_ij_grad, scalar_t* epsilon_ij_grad
+    scalar_t* ene, scalar_t* dr_grad, scalar_t* sigma_ij_grad, scalar_t* epsilon_ij_grad,
+    scalar_t r_on, scalar_t taper_c3, scalar_t taper_c4, scalar_t taper_c5,
+    bool use_taper
 ) {
     if constexpr (USE_LJ) {
         scalar_t rho = sigma_ij / dr;
@@ -31,13 +35,13 @@ __device__ __forceinline__ void vdw_pairwise_kernel(
             *ene += scalar_t(4.0) * epsilon_ij * (rho12 - rho6);
         }
         if ( dr_grad ) {
-            *dr_grad += -dedrho * rho / dr;
+            *dr_grad = -dedrho * rho / dr;
         }
         if ( sigma_ij_grad ) {
-            *sigma_ij_grad += dedrho / dr;
+            *sigma_ij_grad = dedrho / dr;
         }
         if ( epsilon_ij_grad ) {
-            *epsilon_ij_grad += scalar_t(4.0) * (rho12 - rho6);
+            *epsilon_ij_grad = scalar_t(4.0) * (rho12 - rho6);
         }
     }
     else {
@@ -76,6 +80,25 @@ __device__ __forceinline__ void vdw_pairwise_kernel(
             *epsilon_ij_grad = t1 * t2min;
         }
     }
+
+    if (use_taper) {
+        scalar_t pair_ene = ene ? *ene : scalar_t(0.0);
+        scalar_t pair_dedr = dr_grad ? *dr_grad : scalar_t(0.0);
+        apply_vdw_taper<scalar_t>(dr, r_on, taper_c3, taper_c4, taper_c5, pair_ene, pair_dedr);
+        if (ene) {
+            *ene = pair_ene;
+        }
+        if (dr_grad) {
+            *dr_grad = pair_dedr;
+        }
+        scalar_t taper = vdw_taper_value<scalar_t>(dr, r_on, taper_c3, taper_c4, taper_c5);
+        if (sigma_ij_grad) {
+            *sigma_ij_grad *= taper;
+        }
+        if (epsilon_ij_grad) {
+            *epsilon_ij_grad *= taper;
+        }
+    }
 }
 
 
@@ -90,6 +113,11 @@ __global__ void vdw_cuda_kernel(
     scalar_t* sigma,
     scalar_t* epsilon,
     int64_t ntypes,
+    scalar_t r_on,
+    scalar_t taper_c3,
+    scalar_t taper_c4,
+    scalar_t taper_c5,
+    bool use_taper,
     scalar_t* ene_out,
     scalar_t* coord_grad,
     scalar_t* sigma_grad,
@@ -141,6 +169,11 @@ __global__ void vdw_cuda_kernel(
             continue;
         }
 
+        dedr = static_cast<scalar_t>(0.0);
+        sigma_ij_grad = static_cast<scalar_t>(0.0);
+        epsilon_ij_grad = static_cast<scalar_t>(0.0);
+        scalar_t pair_ene = static_cast<scalar_t>(0.0);
+
         if constexpr (USE_TYPE_PAIRS) {
             int64_t type_index = atom_types[i] * ntypes + atom_types[j];
             sigma_ij = sigma[type_index];
@@ -151,17 +184,20 @@ __global__ void vdw_cuda_kernel(
             epsilon_ij = epsilon[index];
         }
 
-        int64_t type_index = atom_types[i] * ntypes + atom_types[j];
         vdw_pairwise_kernel<scalar_t, USE_LJ>(
             rij_vec[0], rij_vec[1], rij_vec[2], r, sigma_ij, epsilon_ij,
-            &ene, 
+            &pair_ene,
             (coord_grad ? &dedr : nullptr), 
             (sigma_grad ? &sigma_ij_grad : nullptr), 
-            (epsilon_grad ? &epsilon_ij_grad : nullptr)
+            (epsilon_grad ? &epsilon_ij_grad : nullptr),
+            r_on, taper_c3, taper_c4, taper_c5, use_taper
         );
+
+        ene += pair_ene;
 
         // Sigma and epsilon gradients
         if constexpr (USE_TYPE_PAIRS) {
+            int64_t type_index = atom_types[i] * ntypes + atom_types[j];
             if ( sigma_grad ) {
                 atomicAdd(&sigma_grad[type_index], sigma_ij_grad);
             }
@@ -209,6 +245,7 @@ static at::Tensor forward(
     at::Tensor& epsilon,
     at::Scalar cutoff,
     c10::optional<at::Tensor> atom_types_optional,
+    at::Scalar r_on_scalar,
     at::Scalar use_lj
 ) {
     int64_t npairs = pairs.size(0);
@@ -221,6 +258,17 @@ static at::Tensor forward(
         atom_types = atom_types_optional.value();
         ntypes = sigma.size(0);
         use_type_pairs = true;
+    }
+
+    double cutoff_val = cutoff.to<double>();
+    double r_on_val = r_on_scalar.to<double>();
+    bool use_taper = r_on_val > 0.0 && r_on_val < cutoff_val;
+    double taper_c3 = 0.0, taper_c4 = 0.0, taper_c5 = 0.0;
+    if (use_taper) {
+        double width = r_on_val - cutoff_val;
+        taper_c3 = 10.0 / std::pow(width, 3.0);
+        taper_c4 = 15.0 / std::pow(width, 4.0);
+        taper_c5 = 6.0 / std::pow(width, 5.0);
     }
 
     auto props = at::cuda::getCurrentDeviceProperties();
@@ -257,6 +305,11 @@ static at::Tensor forward(
                     sigma.data_ptr<scalar_t>(),
                     epsilon.data_ptr<scalar_t>(),
                     ntypes,
+                    static_cast<scalar_t>(r_on_val),
+                    static_cast<scalar_t>(taper_c3),
+                    static_cast<scalar_t>(taper_c4),
+                    static_cast<scalar_t>(taper_c5),
+                    use_taper,
                     ene.data_ptr<scalar_t>(),
                     (coords.requires_grad() ? coord_grad.data_ptr<scalar_t>() : nullptr),
                     (sigma.requires_grad() ? sigma_grad.data_ptr<scalar_t>() : nullptr),
@@ -284,6 +337,7 @@ static std::vector<at::Tensor> backward(
         (saved[4].requires_grad() ? saved[2] * grad_outputs[0] : ignore), // epsilon
         ignore,                     // cutoff
         ignore,                     // atom_types
+        ignore,                     // r_on
         ignore                      // use_lj
     };
 }
@@ -298,10 +352,11 @@ at::Tensor compute_lennard_jones_energy_cuda(
     at::Tensor& sigma,
     at::Tensor& epsilon,
     at::Scalar cutoff,
-    c10::optional<at::Tensor> atom_types_optional
+    c10::optional<at::Tensor> atom_types_optional,
+    at::Scalar r_on
 ) {
     at::Scalar use_lj = at::Scalar(true);
-    return VdwFunctionCuda::apply(coords, pairs, box, sigma, epsilon, cutoff, atom_types_optional, use_lj);
+    return VdwFunctionCuda::apply(coords, pairs, box, sigma, epsilon, cutoff, atom_types_optional, r_on, use_lj);
 }
 
 
@@ -312,10 +367,11 @@ at::Tensor compute_vdw_14_7_energy_cuda(
     at::Tensor& radius,
     at::Tensor& epsilon,
     at::Scalar cutoff,
-    c10::optional<at::Tensor> atom_types_optional
+    c10::optional<at::Tensor> atom_types_optional,
+    at::Scalar r_on
 ) {
     at::Scalar use_lj = at::Scalar(false);
-    return VdwFunctionCuda::apply(coords, pairs, box, radius, epsilon, cutoff, atom_types_optional, use_lj);
+    return VdwFunctionCuda::apply(coords, pairs, box, radius, epsilon, cutoff, atom_types_optional, r_on, use_lj);
 }
 
 
@@ -327,8 +383,9 @@ TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
            at::Tensor sigma,
            at::Tensor epsilon,
            at::Scalar cutoff,
-           c10::optional<at::Tensor> atom_types_optional) {
-            return compute_lennard_jones_energy_cuda(coords, pairs, box, sigma, epsilon, cutoff, atom_types_optional);
+           c10::optional<at::Tensor> atom_types_optional,
+           at::Scalar r_on) {
+            return compute_lennard_jones_energy_cuda(coords, pairs, box, sigma, epsilon, cutoff, atom_types_optional, r_on);
         });
 
     m.impl("compute_vdw_14_7_energy",
@@ -338,8 +395,8 @@ TORCH_LIBRARY_IMPL(torchff, AutogradCUDA, m) {
            at::Tensor radius,
            at::Tensor epsilon,
            at::Scalar cutoff,
-           c10::optional<at::Tensor> atom_types_optional) {
-            return compute_vdw_14_7_energy_cuda(coords, pairs, box, radius, epsilon, cutoff, atom_types_optional);
+           c10::optional<at::Tensor> atom_types_optional,
+           at::Scalar r_on) {
+            return compute_vdw_14_7_energy_cuda(coords, pairs, box, radius, epsilon, cutoff, atom_types_optional, r_on);
         });
 }
-

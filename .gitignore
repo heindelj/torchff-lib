@@ -202,3 +202,6 @@ csrc/nblist/nblist_cluster_pairs_slow_cuda.cu
 examples/torch-sim
 examples/amoeba/md_*/
 examples/tip3p/md_*/
+
+*.err
+*.out

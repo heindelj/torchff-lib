@@ -192,6 +192,9 @@ def _openmm_group_energies_kjmol(
 def build_amoeba_torchff_config(
     pdb_path: str | Path,
     cutoff_nm: float,
+    *,
+    reference_platform: str = "CPU",
+    assign_force_groups: bool = True,
 ) -> tuple[AmoebaTorchFFConfig, app.Topology, dict[str, float]]:
     """
     Load a periodic water PDB, build an OpenMM AMOEBA2018 + PME system, and pack TorchFF buffers.
@@ -233,11 +236,13 @@ def build_amoeba_torchff_config(
         if isinstance(f, mm.AmoebaVdwForce):
             f.setUseDispersionCorrection(False)
 
-    for idx in range(system.getNumForces()):
-        system.getForce(idx).setForceGroup(idx)
+    if assign_force_groups:
+        for idx in range(system.getNumForces()):
+            system.getForce(idx).setForceGroup(idx)
 
     integrator = mm.VerletIntegrator(0.001 * unit.picoseconds)
-    simulation = app.Simulation(topology, system, integrator)
+    platform = mm.Platform.getPlatformByName(reference_platform)
+    simulation = app.Simulation(topology, system, integrator, platform)
     simulation.context.setPositions(pdb.positions)
     simulation.context.setPeriodicBoxVectors(*topology.getPeriodicBoxVectors())
 

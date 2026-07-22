@@ -20,6 +20,7 @@ from torchff.angle import AmoebaAngle
 from torchff.bond import AmoebaBond, HarmonicBond
 from torchff.multipoles import MultipolarInteraction, computeDampFactorsErfc, computeInteractionTensor
 from torchff.nblist import NeighborList
+from torchff.pbc import PBC
 from torchff.pme import PME
 from torchff.ewald import Ewald
 from torchff.multipoles import MultipolarRotation
@@ -37,6 +38,8 @@ _AMOEBA2018_ANGLE_QUARTIC = 0.18383715560065766
 _AMOEBA2018_ANGLE_PENTIC = -0.13166366417009362
 _AMOEBA2018_ANGLE_SEXTIC = 0.23708998569690343
 
+# OpenMM ``AmoebaVdwForce`` uses ``r_on = 0.9 * cutoff`` (see ``AmoebaReferenceVdwForce``).
+# Native taper is enabled via :class:`torchff.vdw.Vdw` ``use_taper=True``.
 
 def _compute_multipolar_energy_from_atom_pairs(
     coords: torch.Tensor,
@@ -113,7 +116,13 @@ class MultipolarAmoeba(MultipolarInteraction):
         thole: torch.Tensor | float = 0.39,
     ):
         super().__init__(rank, cutoff, ewald_alpha, 1.0, True, use_customized_ops, cuda_graph_compat)
-        self.thole = thole
+        # Register ``thole`` as a buffer when it is a tensor so that ``module.to(dtype/device)``
+        # converts it alongside the other inputs to the custom ops (otherwise a float32 ``thole``
+        # reaches a float64 kernel and raises a dtype mismatch, e.g. under ``md_ase.py``).
+        if isinstance(thole, torch.Tensor):
+            self.register_buffer("thole", thole.detach().clone())
+        else:
+            self.thole = thole
 
     def forward(self, coords, box, pairs, q, p, t, polarity, pairs_excl=None):
         if self.use_customized_ops:
@@ -204,7 +213,8 @@ class TorchFFAmoeba(nn.Module):
     ``forward`` expects positions and box in **nanometers**, on the same device/dtype as buffers.
     """
 
-    def __init__(self, config: Any, *, use_customized_ops: bool = True):
+    def __init__(self, config: Any, *, use_customized_ops: bool = True, vdw_taper: bool = True,
+                 pme_customized: bool | None = None):
         """
         Parameters
         ----------
@@ -221,6 +231,14 @@ class TorchFFAmoeba(nn.Module):
             ``thole``, ``excluded_pairs``, ``intra_pairs``.
         use_customized_ops
             Passed through to TorchFF modules.
+        vdw_taper
+            If True (default), apply OpenMM's vdW quintic taper (``r_on = 0.9 * cutoff``) via the
+            native :class:`torchff.vdw.Vdw` kernel. Set False for a hard cutoff at ``cutoff``.
+        pme_customized
+            Backend override for the PME reciprocal-space module only. Defaults to
+            ``use_customized_ops``. Set to ``False`` to use the autograd Python PME for the
+            reciprocal term (e.g. as a cross-check) while keeping every other term on the
+            customized CUDA ops.
         """
         super().__init__()
         c = config
@@ -233,6 +251,7 @@ class TorchFFAmoeba(nn.Module):
         self.n_waters = n_atoms // 3
         self.cutoff_nm = cutoff_nm
         self.use_customized_ops = use_customized_ops
+        self.vdw_taper = bool(vdw_taper)
 
         self.register_buffer("initial_positions_nm", c.initial_positions_nm.detach().clone())
         self.register_buffer("initial_box_nm", c.initial_box_nm.detach().clone())
@@ -268,28 +287,35 @@ class TorchFFAmoeba(nn.Module):
 
         self.max_hkl = max_hkl
 
+        # NOTE: TorchFF customized ops are opaque custom CUDA kernels without fake/meta
+        # registrations, so ``torch.compile``/dynamo cannot trace through them (it raises
+        # "data is not allocated yet" when wrapping ``MultipolarAmoeba``). Like the working
+        # ``examples/tip3p/model.py``, submodules are used in eager mode so both the
+        # customized-ops and pure-Python paths run correctly.
         u = use_customized_ops
-        self.amoeba_bond = torch.compile(AmoebaBond(use_customized_ops=u))
-        self.ub_bond = torch.compile(HarmonicBond(use_customized_ops=u))
-        self.amoeba_angle = torch.compile(AmoebaAngle(use_customized_ops=u))
-        self.vdw = torch.compile(Vdw(
+        self.amoeba_bond = AmoebaBond(use_customized_ops=u)
+        self.ub_bond = HarmonicBond(use_customized_ops=u)
+        self.amoeba_angle = AmoebaAngle(use_customized_ops=u)
+        self.vdw = Vdw(
             "AmoebaVdw147",
             cutoff=cutoff_nm,
             use_customized_ops=u,
             use_type_pairs=True,
-        ))
-        self.multipole = torch.compile(MultipolarAmoeba(
+            use_taper=self.vdw_taper,
+        )
+        self.multipole = MultipolarAmoeba(
             rank=2,
             cutoff=self.cutoff_nm,
             ewald_alpha=self.ewald_alpha,
             use_customized_ops=u,
             thole=self.thole,
-        ))
+        )
+        pme_u = u if pme_customized is None else bool(pme_customized)
         self.pme = PME(
             alpha=self.ewald_alpha,
             max_hkl=max_hkl,
             rank=2,
-            use_customized_ops=u,
+            use_customized_ops=pme_u,
             return_fields=True,
         )
         self.max_npairs = int(n_atoms * 4.0 / 3.0 * math.pi * cutoff_nm**3 * 100.0 / 2.0 * 1.2)
@@ -299,7 +325,7 @@ class TorchFFAmoeba(nn.Module):
             use_customized_ops=u,
             algorithm="nsquared",
         )
-        self.rotation = torch.compile(MultipolarRotation(use_customized_ops=u))
+        self.rotation = MultipolarRotation(use_customized_ops=u)
 
     def energy_components(self, coords_nm: torch.Tensor, box_nm: torch.Tensor) -> dict[str, torch.Tensor]:
         """Energy terms: valence/vdW in kJ/mol; electrostatic pieces in Hartree (``*_hartree``) and kJ/mol (``*_kjmol``)."""

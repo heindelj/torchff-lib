@@ -66,10 +66,37 @@ def default_water_pdb_path(n_waters: int = 3000) -> Path:
     return Path(__file__).resolve().parent.parent / f"water_{int(n_waters)}.pdb"
 
 
+def apply_tip3p_nonbonded_settings(
+    nb_force: mm.NonbondedForce,
+    *,
+    use_switching_function: bool,
+    switching_distance_nm: float | None,
+    cutoff_nm: float,
+) -> None:
+    """Match OpenMM TIP3P nonbonded options used in production MD."""
+    nb_force.setUseDispersionCorrection(False)
+    nb_force.setUseSwitchingFunction(use_switching_function)
+    if use_switching_function:
+        if switching_distance_nm is None:
+            switching_distance_nm = cutoff_nm - 0.1
+        nb_force.setSwitchingDistance(switching_distance_nm * unit.nanometer)
+    nb_force.setReactionFieldDielectric(1.0)
+
+
 def _scalar_in_inv_nm(x) -> float:
     """PME alpha from OpenMM as a float in 1/nm (``Quantity`` or plain float)."""
     if hasattr(x, "value_in_unit"):
-        return float(x.value_in_unit(1.0 / unit.nanometer))
+        try:
+            return float(x.value_in_unit(1.0 / unit.nanometer))
+        except Exception:
+            # Pre-context ``getPMEParameters()`` may use length units; reciprocal length is 1/nm.
+            inv_nm = 1.0 / unit.nanometer
+            if x.unit == inv_nm or x.unit == inv_nm.base_unit:
+                return float(x.value_in_unit(inv_nm))
+            val_nm = float(x.value_in_unit(unit.nanometer))
+            if val_nm <= 0.0:
+                raise ValueError("PME Ewald alpha is unset (zero); initialize a Context first.")
+            return 1.0 / val_nm
     return float(x)
 
 
@@ -126,14 +153,14 @@ def _extract_openmm_valence_and_nb(
     cpu = torch.device("cpu")
     return (
         torch.tensor(bonds, dtype=torch.long, device=cpu),
-        torch.tensor(b0_nm, dtype=torch.float32, device=cpu),
-        torch.tensor(kb_list, dtype=torch.float32, device=cpu),
+        torch.tensor(b0_nm, dtype=torch.float64, device=cpu),
+        torch.tensor(kb_list, dtype=torch.float64, device=cpu),
         torch.tensor(angles, dtype=torch.long, device=cpu),
-        torch.tensor(th0_list, dtype=torch.float32, device=cpu),
-        torch.tensor(kth_list, dtype=torch.float32, device=cpu),
-        torch.tensor(charges, dtype=torch.float32, device=cpu),
-        torch.tensor(sigma_nm, dtype=torch.float32, device=cpu),
-        torch.tensor(eps_kj, dtype=torch.float32, device=cpu),
+        torch.tensor(th0_list, dtype=torch.float64, device=cpu),
+        torch.tensor(kth_list, dtype=torch.float64, device=cpu),
+        torch.tensor(charges, dtype=torch.float64, device=cpu),
+        torch.tensor(sigma_nm, dtype=torch.float64, device=cpu),
+        torch.tensor(eps_kj, dtype=torch.float64, device=cpu),
         nb_force,
     )
 
@@ -219,6 +246,13 @@ def _lj_type_table(sigma_per_atom: torch.Tensor, eps_per_atom: torch.Tensor) -> 
 def build_tip3p_torchff_config(
     pdb_path: str | Path,
     cutoff_nm: float,
+    *,
+    use_switching_function: bool = False,
+    switching_distance_nm: float | None = None,
+    reference_platform: str = "CPU",
+    assign_force_groups: bool = True,
+    ewald_alpha: float | None = None,
+    pme_grid: tuple[int, int, int] | None = None,
 ) -> tuple[Tip3pTorchFFConfig, app.Topology, dict[str, float]]:
     """
     Load a periodic water PDB, build an OpenMM TIP3P+PME system, and pack TorchFF buffers.
@@ -244,8 +278,8 @@ def build_tip3p_torchff_config(
         dtype=np.float64,
     )
     cpu = torch.device("cpu")
-    initial_positions_nm = torch.tensor(pos_nm_np, dtype=torch.float32, device=cpu)
-    initial_box_nm = torch.tensor(box_nm_np, dtype=torch.float32, device=cpu)
+    initial_positions_nm = torch.tensor(pos_nm_np, dtype=torch.float64, device=cpu)
+    initial_box_nm = torch.tensor(box_nm_np, dtype=torch.float64, device=cpu)
 
     ff = app.ForceField("tip3p.xml")
     system = ff.createSystem(
@@ -259,12 +293,16 @@ def build_tip3p_torchff_config(
 
     for f in system.getForces():
         if isinstance(f, mm.NonbondedForce):
-            f.setUseDispersionCorrection(False)
-            f.setUseSwitchingFunction(False)
-            f.setReactionFieldDielectric(1.0)
+            apply_tip3p_nonbonded_settings(
+                f,
+                use_switching_function=use_switching_function,
+                switching_distance_nm=switching_distance_nm,
+                cutoff_nm=cutoff_nm,
+            )
 
-    for idx in range(system.getNumForces()):
-        system.getForce(idx).setForceGroup(idx)
+    if assign_force_groups:
+        for idx in range(system.getNumForces()):
+            system.getForce(idx).setForceGroup(idx)
 
     (
         bonds,
@@ -280,13 +318,30 @@ def build_tip3p_torchff_config(
     ) = _extract_openmm_valence_and_nb(system)
 
     integrator = mm.VerletIntegrator(0.001 * unit.picoseconds)
-    simulation = app.Simulation(topology, system, integrator)
+    platform = mm.Platform.getPlatformByName(reference_platform)
+    simulation = app.Simulation(topology, system, integrator, platform)
     simulation.context.setPositions(pdb.positions)
     simulation.context.setPeriodicBoxVectors(*topology.getPeriodicBoxVectors())
 
-    alpha_raw, nx, ny, nz = nb_force.getPMEParametersInContext(simulation.context)
-    ewald_alpha = _scalar_in_inv_nm(alpha_raw)
-    max_hkl = int(max(int(nx), int(ny), int(nz)))
+    if ewald_alpha is not None and pme_grid is not None:
+        nx, ny, nz = (int(pme_grid[0]), int(pme_grid[1]), int(pme_grid[2]))
+        ewald_alpha_val = float(ewald_alpha)
+        max_hkl = int(max(nx, ny, nz))
+    else:
+        try:
+            alpha_raw, nx, ny, nz = nb_force.getPMEParametersInContext(simulation.context)
+        except mm.OpenMMException as exc:
+            raise RuntimeError(
+                f"getPMEParametersInContext failed on platform {reference_platform!r}. "
+                "For TIP3P use Reference or CUDA (must match the OpenMM energy platform)."
+            ) from exc
+        nx, ny, nz = int(nx), int(ny), int(nz)
+        if nx <= 0 or ny <= 0 or nz <= 0:
+            raise RuntimeError(
+                f"Invalid PME grid ({nx}, {ny}, {nz}) on platform {reference_platform!r}."
+            )
+        ewald_alpha_val = _scalar_in_inv_nm(alpha_raw)
+        max_hkl = int(max(nx, ny, nz))
 
     sigma_table, epsilon_table = _lj_type_table(sigma_atom.to(cpu), eps_atom.to(cpu))
     exclusions = _water_intramolecular_exclusions(n_waters, device=cpu)
@@ -303,7 +358,7 @@ def build_tip3p_torchff_config(
     cfg = Tip3pTorchFFConfig(
         natoms=int(n_atoms),
         cutoff_nm=float(cutoff_nm),
-        ewald_alpha=float(ewald_alpha),
+        ewald_alpha=float(ewald_alpha_val),
         max_hkl=max_hkl,
         initial_positions_nm=initial_positions_nm,
         initial_box_nm=initial_box_nm,
@@ -402,9 +457,12 @@ def run_energy_vs_openmm(
     *,
     n_waters: int = 3000,
     cutoff_nm: float = 0.8,
+    use_switching_function: bool = False,
+    switching_distance_nm: float | None = None,
     device: torch.device | None = None,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.float64,
     use_customized_ops: bool = False,
+    vdw_taper: bool = False,
 ) -> float:
     """
     Build from PDB, assert energy terms match OpenMM, return total TorchFF energy (kJ/mol).
@@ -416,7 +474,17 @@ def run_energy_vs_openmm(
         raise FileNotFoundError(f"Missing PDB: {pdb_path}")
 
     device = device or torch.device("cuda")
-    cfg, _topology, ref = build_tip3p_torchff_config(pdb_path, cutoff_nm)
+    if vdw_taper and not use_switching_function:
+        use_switching_function = True
+    if switching_distance_nm is None and use_switching_function:
+        switching_distance_nm = cutoff_nm - 0.1
+
+    cfg, _topology, ref = build_tip3p_torchff_config(
+        pdb_path,
+        cutoff_nm,
+        use_switching_function=use_switching_function,
+        switching_distance_nm=switching_distance_nm,
+    )
     pdb = app.PDBFile(str(pdb_path))
     pos = pdb.getPositions(asNumpy=True)
     coords_nm = torch.tensor(np.asarray(pos), dtype=dtype, device=device)
@@ -427,7 +495,12 @@ def run_energy_vs_openmm(
         device=device,
     )
 
-    model = Tip3pTorchFF(cfg, use_customized_ops=use_customized_ops).to(device, dtype)
+    model = Tip3pTorchFF(
+        cfg,
+        use_customized_ops=use_customized_ops,
+        vdw_taper=vdw_taper,
+        switching_distance_nm=switching_distance_nm,
+    ).to(device, dtype)
     model.eval()
 
     with torch.no_grad():
@@ -562,9 +635,12 @@ def test_md_native_openmm(pdb_path: Path, *, cutoff_nm: float, md_steps: int = 2
     )
     for f in system.getForces():
         if isinstance(f, mm.NonbondedForce):
-            f.setUseDispersionCorrection(False)
-            f.setUseSwitchingFunction(False)
-            f.setReactionFieldDielectric(1.0)
+            apply_tip3p_nonbonded_settings(
+                f,
+                use_switching_function=False,
+                switching_distance_nm=None,
+                cutoff_nm=cutoff_nm,
+            )
 
     integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
     platform = mm.Platform.getPlatformByName("CUDA")
@@ -662,18 +738,44 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip native OpenMM and TorchForce MD benchmarks; only run energy checks.",
     )
+    p.add_argument(
+        "--pdb-path",
+        type=Path,
+        default=None,
+        help="Input water box PDB (default: examples/water_<N>.pdb).",
+    )
+    taper = p.add_mutually_exclusive_group()
+    taper.add_argument(
+        "--vdw-taper",
+        dest="vdw_taper",
+        action="store_true",
+        default=None,
+        help="Enable OpenMM vdW switching and TorchFF vdW taper.",
+    )
+    taper.add_argument(
+        "--no-vdw-taper",
+        dest="vdw_taper",
+        action="store_false",
+        help="Hard vdW cutoff (no taper).",
+    )
+    p.add_argument(
+        "--switching-distance-nm",
+        type=float,
+        default=None,
+        help="LJ switching distance (nm); default cutoff - 0.1 when taper is on.",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     assert torch.cuda.is_available(), "This example requires CUDA and TorchFF custom ops."
-    torch.set_default_dtype(torch.float32)
+    torch.set_default_dtype(torch.float64)
 
     args = _parse_args()
     use_customized_ops = bool(args.use_customized_ops)
     use_cuda_graphs = use_customized_ops
 
-    pdb_path = default_water_pdb_path(args.n_waters)
+    pdb_path = args.pdb_path or default_water_pdb_path(args.n_waters)
     if not pdb_path.is_file():
         raise FileNotFoundError(
             f"Missing PDB for N={args.n_waters}: {pdb_path}. "
@@ -681,8 +783,13 @@ def main() -> None:
         )
 
     cutoff_nm = 0.8
+    vdw_taper = bool(args.vdw_taper) if args.vdw_taper is not None else False
+    use_switching = vdw_taper
+    switching_distance_nm = args.switching_distance_nm
+    if use_switching and switching_distance_nm is None:
+        switching_distance_nm = cutoff_nm - 0.1
     device = torch.device("cuda")
-    dtype = torch.float32
+    dtype = torch.float64
     pdb = app.PDBFile(str(pdb_path))
     coords_nm = torch.tensor(np.asarray(pdb.getPositions(asNumpy=True)), dtype=dtype, device=device)
     box_nm = torch.tensor(
@@ -691,8 +798,18 @@ def main() -> None:
         device=device,
     )
 
-    cfg, _topology, openmm_ref = build_tip3p_torchff_config(pdb_path, cutoff_nm)
-    model = Tip3pTorchFF(cfg, use_customized_ops=use_customized_ops).to(device, dtype)
+    cfg, _topology, openmm_ref = build_tip3p_torchff_config(
+        pdb_path,
+        cutoff_nm,
+        use_switching_function=use_switching,
+        switching_distance_nm=switching_distance_nm,
+    )
+    model = Tip3pTorchFF(
+        cfg,
+        use_customized_ops=use_customized_ops,
+        vdw_taper=vdw_taper,
+        switching_distance_nm=switching_distance_nm,
+    ).to(device, dtype)
     model.eval()
     with torch.no_grad():
         energy = model(coords_nm, box_nm)
@@ -703,6 +820,7 @@ def main() -> None:
 
     print(
         f"n_waters={args.n_waters} use_customized_ops={use_customized_ops} "
+        f"vdw_taper={vdw_taper} switching_distance_nm={switching_distance_nm} "
         f"torchforce_use_cuda_graphs={use_cuda_graphs}"
     )
     print(f"energy_vs_openmm: total energy (kJ/mol) = {float(energy.item()):.6f}")

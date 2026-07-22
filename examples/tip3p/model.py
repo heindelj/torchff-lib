@@ -26,7 +26,14 @@ COULOMB_PREFACTOR_KJMOL = 138.935456
 class Tip3pTorchFF(nn.Module):
     """TIP3P water box: bond + angle + LJ + screened real-space Coulomb + reciprocal PME."""
 
-    def __init__(self, config: Any, *, use_customized_ops: bool = False):
+    def __init__(
+        self,
+        config: Any,
+        *,
+        use_customized_ops: bool = False,
+        vdw_taper: bool = False,
+        switching_distance_nm: float | None = None,
+    ):
         """
         Parameters
         ----------
@@ -40,11 +47,17 @@ class Tip3pTorchFF(nn.Module):
             ``atom_types``, ``excluded_pairs``, ``coulomb_excl_pairs``.
         use_customized_ops
             Passed through to TorchFF modules.
+        vdw_taper
+            If True, apply OpenMM's vdW quintic taper (``switching_distance_nm`` to ``cutoff_nm``).
+        switching_distance_nm
+            Inner taper distance (nm) for Lennard-Jones; required when ``vdw_taper`` is True.
         """
         super().__init__()
         c = config
         n_atoms = int(c.natoms)
         cutoff_nm = float(c.cutoff_nm)
+        if vdw_taper and switching_distance_nm is None:
+            raise ValueError("switching_distance_nm is required when vdw_taper=True")
         ewald_alpha = float(c.ewald_alpha)
         max_hkl = int(c.max_hkl)
 
@@ -74,12 +87,14 @@ class Tip3pTorchFF(nn.Module):
             use_customized_ops=use_customized_ops,
             use_type_pairs=True,
             sum_output=True,
+            use_taper=vdw_taper,
+            switching_distance=switching_distance_nm,
         )
         self.coul = MultipolarInteraction(
             rank=0,
             cutoff=cutoff_nm,
             ewald_alpha=ewald_alpha,
-            prefactor=COULOMB_PREFACTOR_KJMOL,
+            # prefactor=COULOMB_PREFACTOR_KJMOL,
             use_customized_ops=use_customized_ops,
         )
         self.pme = PME(
@@ -109,9 +124,9 @@ class Tip3pTorchFF(nn.Module):
         )
         e_coul = self.coul(
             coords, box, pairs, self.charges, pairs_excl=self.coulomb_excl_pairs
-        )
+        ) #* COULOMB_PREFACTOR_KJMOL
         e_pme_raw = self.pme(coords, box, self.charges)
-        e_pme = e_pme_raw * COULOMB_PREFACTOR_KJMOL
+        e_pme = e_pme_raw #* COULOMB_PREFACTOR_KJMOL
         return {
             "HarmonicBondForce": e_bond,
             "HarmonicAngleForce": e_ang,
@@ -119,7 +134,7 @@ class Tip3pTorchFF(nn.Module):
             "Coulomb_real": e_coul,
             "Coulomb_reciprocal": e_pme,
             "Coulomb_reciprocal_raw": e_pme_raw,
-            "Coulomb": e_coul + e_pme,
+            "Coulomb": (e_coul + e_pme) * COULOMB_PREFACTOR_KJMOL ,
         }
 
     def forward(self, coords: torch.Tensor, box: torch.Tensor) -> torch.Tensor:
@@ -128,6 +143,7 @@ class Tip3pTorchFF(nn.Module):
             c["HarmonicBondForce"]
             + c["HarmonicAngleForce"]
             + c["LennardJones"]
-            + c["Coulomb_real"]
-            + c["Coulomb_reciprocal"]
+            # + c["Coulomb_real"]
+            # + c["Coulomb_reciprocal"]
+            + c["Coulomb"]
         )

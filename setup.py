@@ -46,6 +46,7 @@ if _BUILD_CUDA:
         build_cuda_extension('ewald', ['ewald_optimized.cu']),
         build_cuda_extension('pme'),
         build_cuda_extension('cmm'),
+        build_cuda_extension('ffterms'),
         # only compile the fused nonbonded atom-pair kernel in csrc/nonbonded
         CUDAExtension(
             name='torchff_nb',

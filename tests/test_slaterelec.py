@@ -93,12 +93,27 @@ def test_device_math_matches_torch(tmp_path):
 
     # field VJP: d/d(everything) of  lam . dE/dm   (nested duals on the device side)
     L = (torch.stack([g[0], g[1]]) * lam).sum()
-    h = torch.autograd.grad(L, leaves)
+    h = torch.autograd.grad(L, leaves, retain_graph=True)
     assert abs(L.item() - out["vjp_e"][0]) < 1e-14
     for name, ht in zip(["vjp_mi", "vjp_mj", "vjp_ni", "vjp_nj", "vjp_dr"], h[:5]):
         for k in range(ht.numel()):
             assert abs(ht[k].item() - out[name][k]) < 1e-12 * max(1.0, abs(ht[k].item())), (name, k)
     assert abs(h[5][0].item() - out["vjp_bi"][0]) < 1e-13 and abs(h[5][1].item() - out["vjp_bj"][0]) < 1e-13
+
+    # energy HVP: every input seeded with a direction v; tangent(dE/d*) must be H v, i.e.
+    # d/d(everything) of  v . dE/d(everything)  -- the double backward of the energy op
+    v = [torch.tensor(t, dtype=DT) for t in (
+        [0.7, -0.2, 0.4, 0.1, 0.05, -0.03, 0.02, 0.06, -0.01, 0.03],
+        [-0.3, 0.5, 0.1, -0.6, 0.02, 0.04, -0.05, 0.01, 0.03, -0.02],
+        [0.2] + [0.0] * 9, [-0.4] + [0.0] * 9, [0.13, -0.27, 0.05], [0.31, -0.17])]
+    Lv = sum((gt * vt).sum() for gt, vt in zip(g, v))
+    hv = torch.autograd.grad(Lv, leaves)
+    assert abs(Lv.item() - out["hvp_e"][0]) < 1e-13 * max(1.0, abs(Lv.item()))
+    for name, ht in zip(["hvp_mi", "hvp_mj", "hvp_ni", "hvp_nj", "hvp_dr"], hv[:5]):
+        for k in range(ht.numel()):
+            assert abs(ht[k].item() - out[name][k]) < 1e-11 * max(1.0, abs(ht[k].item())), (name, k)
+    assert abs(hv[5][0].item() - out["hvp_bi"][0]) < 1e-12 * max(1.0, abs(hv[5][0].item()))
+    assert abs(hv[5][1].item() - out["hvp_bj"][0]) < 1e-12 * max(1.0, abs(hv[5][1].item()))
 
 
 # --- 3 ---------------------------------------------------------------------------------------
@@ -121,6 +136,34 @@ def test_energy_kernel_matches_ref_first_order(K):
     g_op = torch.autograd.grad((e_op * w).sum(), leaves)
     for a, c in zip(g_ref, g_op):
         assert torch.allclose(a, c, rtol=1e-10, atol=1e-13)
+
+
+@needs_cuda
+@pytest.mark.parametrize("K", [1, 4, 10])
+def test_energy_kernel_double_backward_matches_ref(K):
+    """A force loss through the kernel: ``|| dE/dcoords ||^2`` (+ the other first derivatives,
+    weighted) backpropagated into every input, kernel vs reference, and gradgradcheck."""
+    args = _system(K=K, device="cuda")
+    coords, pairs, b, gate, m, n = args
+    leaves = (coords, b, gate, m, n)
+    ws = [torch.randn_like(t) for t in leaves]
+
+    def loss(fn):
+        e = fn(*args)
+        w = torch.linspace(0.5, 1.5, e.numel(), dtype=e.dtype, device=e.device)
+        g = torch.autograd.grad((e * w).sum(), leaves, create_graph=True)
+        return sum((gk * gk * wk).sum() + (gk * wk).sum() for gk, wk in zip(g, ws))
+
+    l_ref = loss(se.slater_elec_pair_energy_ref)
+    l_op = loss(lambda *a: se.slater_elec_pair_energy(*a, use_customized_ops=True))
+    assert torch.allclose(l_op, l_ref, rtol=1e-10)
+    h_ref = torch.autograd.grad(l_ref, leaves)
+    h_op = torch.autograd.grad(l_op, leaves)
+    for a, c in zip(h_ref, h_op):
+        assert torch.allclose(a, c, rtol=1e-9, atol=1e-12)
+    assert torch.autograd.gradgradcheck(
+        lambda c, bb, gg, mm, nn: se.slater_elec_pair_energy(c, pairs, bb, gg, mm, nn, use_customized_ops=True),
+        leaves, nondet_tol=1e-11)
 
 
 @needs_cuda

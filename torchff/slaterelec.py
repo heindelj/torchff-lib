@@ -10,8 +10,10 @@ per pair, gated by a caller-supplied ``(P,)`` weight.
 
 Two ops, each with a pure-torch reference and a CUDA kernel:
 
-* :func:`slater_elec_pair_energy` -- ``(P,)`` energies. **First-order autograd only** through
-  the kernel (coords, b, gate, m, n); double backward is the M4 milestone.
+* :func:`slater_elec_pair_energy` -- ``(P,)`` energies, with **double backward** through the
+  kernel (the ``ffterms`` Energy/Grad pattern: the backward of the gradient op is the
+  Hessian-vector product, the gradient kernel instantiated on dual numbers), so a force loss
+  can be trained through it.
 * :func:`slater_elec_field` -- ``dE/dm`` as ``(N, K)``: the matvec of a coupled polarization
   solve. Its backward is the exact VJP with respect to every input (a nested dual-number
   evaluation of the per-pair math), which is what an adjoint solve needs.
@@ -324,6 +326,39 @@ def slater_elec_field_ref(coords, pairs, b, gate, m, n) -> torch.Tensor:
 # kernels + autograd
 # ---------------------------------------------------------------------------------------
 
+class _EnergyGrad(torch.autograd.Function):
+    """``(coords, b, gate, m, n, g) -> g-weighted first derivatives``; its backward is the HVP.
+
+    The ``ffterms`` pattern: ``_Energy.backward`` calls this instead of scaling saved tensors,
+    so a force loss can be backpropagated through the kernel (``create_graph=True``). The
+    backward instantiates the per-pair math on ``Dual`` with the cotangents as tangent seeds
+    (``energy_hvp_kernel``).
+    """
+
+    @staticmethod
+    def forward(ctx, coords, pairs, b, gate, m, n, g):
+        K = m.shape[1]
+        d_coords, d_b, d_gate, d_m, d_n = torch.ops.torchff.slater_elec_pair_grad(
+            coords, pairs, b, gate, m, n, g
+        )
+        ctx.save_for_backward(coords, pairs, b, gate, m, n, g)
+        return d_coords, d_b, d_gate, d_m[:, :K].contiguous(), d_n[:, :K].contiguous()
+
+    @staticmethod
+    def backward(ctx, v_coords, v_b, v_gate, v_m, v_n):
+        coords, pairs, b, gate, m, n, g = ctx.saved_tensors
+        K = m.shape[1]
+        v_coords = torch.zeros_like(coords) if v_coords is None else v_coords.contiguous()
+        v_b = torch.zeros_like(b) if v_b is None else v_b.contiguous()
+        v_gate = torch.zeros_like(gate) if v_gate is None else v_gate.contiguous()
+        v_m = torch.zeros_like(m) if v_m is None else v_m.contiguous()
+        v_n = torch.zeros_like(n) if v_n is None else v_n.contiguous()
+        o_coords, o_b, o_gate, o_m, o_n, o_g = torch.ops.torchff.slater_elec_pair_hvp(
+            coords, pairs, b, gate, m, n, g, v_coords, v_b, v_gate, v_m, v_n
+        )
+        return o_coords, None, o_b, o_gate, o_m[:, :K], o_n[:, :K], o_g
+
+
 class _Energy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, coords, pairs, b, gate, m, n):
@@ -333,11 +368,10 @@ class _Energy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, g):
         coords, pairs, b, gate, m, n = ctx.saved_tensors
-        d_coords, d_b, d_gate, d_m, d_n = torch.ops.torchff.slater_elec_pair_grad(
+        d_coords, d_b, d_gate, d_m, d_n = _EnergyGrad.apply(
             coords, pairs, b, gate, m, n, g.contiguous()
         )
-        K = m.shape[1]
-        return d_coords, None, d_b, d_gate, d_m[:, :K], d_n[:, :K]
+        return d_coords, None, d_b, d_gate, d_m, d_n
 
 
 class _Field(torch.autograd.Function):
@@ -363,7 +397,7 @@ def _prep(coords, pairs, b, gate, m, n):
 
 
 def slater_elec_pair_energy(coords, pairs, b, gate, m, n, *, use_customized_ops=None):
-    """``(P,)`` gated Slater-penetrated multipole energies (first-order autograd on CUDA)."""
+    """``(P,)`` gated Slater-penetrated multipole energies; double backward on CUDA too."""
     if _use_kernel(coords, use_customized_ops):
         return _Energy.apply(*_prep(coords, pairs, b, gate, m, n))
     return slater_elec_pair_energy_ref(coords, pairs, b, gate, m, n)

@@ -50,5 +50,28 @@ int main() {
         for (int k = 0; k < 3; ++k) printf("vjp_dr %d %.17e\n", k, gdr2[k].d);
         printf("vjp_bi 0 %.17e\nvjp_bj 0 %.17e\n", gbi2.d, gbj2.d);
     }
+    // energy HVP: every input seeded (the double backward of the energy op). Prints
+    // tangent(e) = v . dE/d*  and  tangent(dE/d*) = H v.
+    {
+        using D = Dual<double>;
+        double v_mi[10] = {0.7, -0.2, 0.4, 0.1, 0.05, -0.03, 0.02, 0.06, -0.01, 0.03};
+        double v_mj[10] = {-0.3, 0.5, 0.1, -0.6, 0.02, 0.04, -0.05, 0.01, 0.03, -0.02};
+        double v_ni[10] = {0.2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        double v_nj[10] = {-0.4, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        double v_dr[3] = {0.13, -0.27, 0.05};
+        double v_bi = 0.31, v_bj = -0.17;
+        D mi[10], mj[10], ni[10], nj[10];
+        for (int k = 0; k < 10; ++k) { mi[k] = D(m_i[k], v_mi[k]); mj[k] = D(m_j[k], v_mj[k]); ni[k] = D(n_i[k], v_ni[k]); nj[k] = D(n_j[k], v_nj[k]); }
+        D e3, gmi[10], gmj[10], gni[10], gnj[10], gdr3[3], gbi3, gbj3;
+        slater_elec_pair_full<D>(mi, mj, ni, nj, D(dr[0], v_dr[0]), D(dr[1], v_dr[1]), D(dr[2], v_dr[2]),
+                                 D(b_i, v_bi), D(b_j, v_bj), e3, gmi, gmj, gni, gnj, gdr3, gbi3, gbj3);
+        printf("hvp_e 0 %.17e\n", e3.d);
+        for (int k = 0; k < 10; ++k) printf("hvp_mi %d %.17e\n", k, gmi[k].d);
+        for (int k = 0; k < 10; ++k) printf("hvp_mj %d %.17e\n", k, gmj[k].d);
+        for (int k = 0; k < 10; ++k) printf("hvp_ni %d %.17e\n", k, gni[k].d);
+        for (int k = 0; k < 10; ++k) printf("hvp_nj %d %.17e\n", k, gnj[k].d);
+        for (int k = 0; k < 3; ++k) printf("hvp_dr %d %.17e\n", k, gdr3[k].d);
+        printf("hvp_bi 0 %.17e\nhvp_bj 0 %.17e\n", gbi3.d, gbj3.d);
+    }
     return 0;
 }

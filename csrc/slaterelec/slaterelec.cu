@@ -2,6 +2,10 @@
 //
 //   slater_elec_pair_energy  (coords, pairs, b, gate, m, n)         -> e (P,)
 //   slater_elec_pair_grad    (coords, pairs, b, gate, m, n, g)      -> (d_coords, d_b, d_gate, d_m, d_n)
+//   slater_elec_pair_hvp     (coords, pairs, b, gate, m, n, g,
+//                             v_coords, v_b, v_gate, v_m, v_n)      -> (o_coords, o_b, o_gate, o_m, o_n, o_g)
+//                            the backward of _grad: cotangents v on its five outputs in,
+//                            gradients w.r.t. its six inputs out (double backward)
 //   slater_elec_field        (coords, pairs, b, gate, m, n)         -> f (N, 10) = d(sum e)/dm
 //   slater_elec_field_vjp    (coords, pairs, b, gate, m, n, lam)    -> (d_coords, d_b, d_gate, d_m, d_n)
 //
@@ -86,6 +90,55 @@ __global__ void energy_grad_kernel(
         atomicAdd(d_b + i, w * gbi); atomicAdd(d_b + j, w * gbj);
         add_mp(d_m, i, gmi, w); add_mp(d_m, j, gmj, w);
         add_mp(d_n, i, gni, w); add_mp(d_n, j, gnj, w);
+    }
+}
+
+
+// ------------------------------------------------------------------------------------
+// energy HVP (the backward of the energy VJP): with L = sum_k v_k . grad_k, where grad_k
+// are the five outputs of energy_grad_kernel, return dL/d(coords, b, gate, m, n, g).
+// Seeding (dr, b, m, n) with the cotangents and instantiating the pair math on Dual gives
+// tangent(E) = v . dE/d* and tangent(dE/d*) = H v per pair, so
+//   dL/dg_p    = gate_p tangent(E_p) + v_gate_p E_p
+//   dL/dgate_p = g_p tangent(E_p)
+//   dL/dtheta  = sum_p g_p [ gate_p tangent(dE_p/dtheta) + v_gate_p dE_p/dtheta ]
+// ------------------------------------------------------------------------------------
+template <typename S>
+__global__ void energy_hvp_kernel(
+    const S* __restrict__ coords, const int64_t* __restrict__ pairs, const S* __restrict__ b,
+    const S* __restrict__ gate, const S* __restrict__ m, const S* __restrict__ n, int K, int64_t P,
+    const S* __restrict__ g,
+    const S* __restrict__ v_coords, const S* __restrict__ v_b, const S* __restrict__ v_gate,
+    const S* __restrict__ v_m, const S* __restrict__ v_n,
+    S* __restrict__ o_coords, S* __restrict__ o_b, S* __restrict__ o_gate, S* __restrict__ o_m, S* __restrict__ o_n,
+    S* __restrict__ o_g
+) {
+    using D = Dual<S>;
+    for (int64_t p = blockIdx.x * (int64_t)BLOCK + threadIdx.x; p < P; p += (int64_t)gridDim.x * BLOCK) {
+        int64_t i = pairs[2 * p], j = pairs[2 * p + 1];
+        S m_i[10], m_j[10], n_i[10], n_j[10], vm_i[10], vm_j[10], vn_i[10], vn_j[10];
+        load_mp(m, i, K, m_i); load_mp(m, j, K, m_j); load_mp(n, i, K, n_i); load_mp(n, j, K, n_j);
+        load_mp(v_m, i, K, vm_i); load_mp(v_m, j, K, vm_j); load_mp(v_n, i, K, vn_i); load_mp(v_n, j, K, vn_j);
+        D mi[10], mj[10], ni[10], nj[10];
+        for (int k = 0; k < 10; ++k) { mi[k] = D(m_i[k], vm_i[k]); mj[k] = D(m_j[k], vm_j[k]); ni[k] = D(n_i[k], vn_i[k]); nj[k] = D(n_j[k], vn_j[k]); }
+        D dx(coords[3 * j] - coords[3 * i],         v_coords[3 * j] - v_coords[3 * i]);
+        D dy(coords[3 * j + 1] - coords[3 * i + 1], v_coords[3 * j + 1] - v_coords[3 * i + 1]);
+        D dz(coords[3 * j + 2] - coords[3 * i + 2], v_coords[3 * j + 2] - v_coords[3 * i + 2]);
+        D e, gmi[10], gmj[10], gni[10], gnj[10], gdr[3], gbi, gbj;
+        slater_elec_pair_full<D>(mi, mj, ni, nj, dx, dy, dz, D(b[i], v_b[i]), D(b[j], v_b[j]), e, gmi, gmj, gni, gnj, gdr, gbi, gbj);
+        S gp = g[p], w = gate[p], vg = v_gate[p];
+        o_g[p] = w * e.d + vg * e.v;
+        o_gate[p] = gp * e.d;
+        // dL/dtheta = g_p * (gate_p * tangent + v_gate_p * primal)
+        S c[3] = {gp * (w * gdr[0].d + vg * gdr[0].v), gp * (w * gdr[1].d + vg * gdr[1].v), gp * (w * gdr[2].d + vg * gdr[2].v)};
+        atomicAdd(o_coords + 3 * i, -c[0]); atomicAdd(o_coords + 3 * i + 1, -c[1]); atomicAdd(o_coords + 3 * i + 2, -c[2]);
+        atomicAdd(o_coords + 3 * j,  c[0]); atomicAdd(o_coords + 3 * j + 1,  c[1]); atomicAdd(o_coords + 3 * j + 2,  c[2]);
+        atomicAdd(o_b + i, gp * (w * gbi.d + vg * gbi.v)); atomicAdd(o_b + j, gp * (w * gbj.d + vg * gbj.v));
+        S t[10];
+        for (int k = 0; k < 10; ++k) t[k] = w * gmi[k].d + vg * gmi[k].v; add_mp(o_m, i, t, gp);
+        for (int k = 0; k < 10; ++k) t[k] = w * gmj[k].d + vg * gmj[k].v; add_mp(o_m, j, t, gp);
+        for (int k = 0; k < 10; ++k) t[k] = w * gni[k].d + vg * gni[k].v; add_mp(o_n, i, t, gp);
+        for (int k = 0; k < 10; ++k) t[k] = w * gnj[k].d + vg * gnj[k].v; add_mp(o_n, j, t, gp);
     }
 }
 
@@ -193,6 +246,37 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> slater_el
     return {d_coords, d_b, d_gate, d_m, d_n};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> slater_elec_pair_hvp_cuda(
+    const at::Tensor& coords, const at::Tensor& pairs, const at::Tensor& b, const at::Tensor& gate,
+    const at::Tensor& m, const at::Tensor& n, const at::Tensor& g,
+    const at::Tensor& v_coords, const at::Tensor& v_b, const at::Tensor& v_gate,
+    const at::Tensor& v_m, const at::Tensor& v_n
+) {
+    const c10::cuda::CUDAGuard guard(coords.device());
+    CHECK_MP(m); CHECK_MP(n); CHECK_MP(v_m); CHECK_MP(v_n);
+    TORCH_CHECK(v_m.size(1) == m.size(1) && v_n.size(1) == n.size(1), "v_m / v_n must have the same K as m / n");
+    int64_t P = pairs.size(0);
+    int K = (int)m.size(1);
+    auto o_coords = at::zeros_like(coords);
+    auto o_b = at::zeros_like(b);
+    auto o_gate = at::empty_like(gate);
+    auto o_m = at::zeros({m.size(0), 10}, m.options());
+    auto o_n = at::zeros({n.size(0), 10}, n.options());
+    auto o_g = at::empty_like(g);
+    if (P == 0) return {o_coords, o_b, o_gate, o_m, o_n, o_g};
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "slater_elec_pair_hvp", [&] {
+        energy_hvp_kernel<scalar_t><<<grid_for(P), BLOCK, 0, stream>>>(
+            coords.data_ptr<scalar_t>(), pairs.data_ptr<int64_t>(), b.data_ptr<scalar_t>(), gate.data_ptr<scalar_t>(),
+            m.data_ptr<scalar_t>(), n.data_ptr<scalar_t>(), K, P, g.data_ptr<scalar_t>(),
+            v_coords.data_ptr<scalar_t>(), v_b.data_ptr<scalar_t>(), v_gate.data_ptr<scalar_t>(),
+            v_m.data_ptr<scalar_t>(), v_n.data_ptr<scalar_t>(),
+            o_coords.data_ptr<scalar_t>(), o_b.data_ptr<scalar_t>(), o_gate.data_ptr<scalar_t>(),
+            o_m.data_ptr<scalar_t>(), o_n.data_ptr<scalar_t>(), o_g.data_ptr<scalar_t>());
+    });
+    return {o_coords, o_b, o_gate, o_m, o_n, o_g};
+}
+
 at::Tensor slater_elec_field_cuda(
     const at::Tensor& coords, const at::Tensor& pairs, const at::Tensor& b, const at::Tensor& gate,
     const at::Tensor& m, const at::Tensor& n
@@ -243,6 +327,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> slater_el
 TORCH_LIBRARY_IMPL(torchff, CUDA, m) {
     m.impl("slater_elec_pair_energy", slater_elec_pair_energy_cuda);
     m.impl("slater_elec_pair_grad", slater_elec_pair_grad_cuda);
+    m.impl("slater_elec_pair_hvp", slater_elec_pair_hvp_cuda);
     m.impl("slater_elec_field", slater_elec_field_cuda);
     m.impl("slater_elec_field_vjp", slater_elec_field_vjp_cuda);
 }

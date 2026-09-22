@@ -73,5 +73,28 @@ int main() {
         for (int k = 0; k < 3; ++k) printf("hvp_dr %d %.17e\n", k, gdr3[k].d);
         printf("hvp_bi 0 %.17e\nhvp_bj 0 %.17e\n", gbi3.d, gbj3.d);
     }
+    // Pauli: energy, first derivatives, and the HVP with every input seeded
+    {
+        double b_ij = 2.1, e4, gai[10], gaj[10], gdr4[3], gb4;
+        slater_pauli_pair_full<double>(m_i, m_j, dr[0], dr[1], dr[2], b_ij, e4, gai, gaj, gdr4, gb4);
+        printf("pauli_e 0 %.17e\n", e4);
+        for (int k = 0; k < 10; ++k) printf("pauli_gai %d %.17e\n", k, gai[k]);
+        for (int k = 0; k < 10; ++k) printf("pauli_gaj %d %.17e\n", k, gaj[k]);
+        for (int k = 0; k < 3; ++k) printf("pauli_gdr %d %.17e\n", k, gdr4[k]);
+        printf("pauli_gb 0 %.17e\n", gb4);
+        using D = Dual<double>;
+        double v_ai[10] = {0.7, -0.2, 0.4, 0.1, 0.05, -0.03, 0.02, 0.06, -0.01, 0.03};
+        double v_aj[10] = {-0.3, 0.5, 0.1, -0.6, 0.02, 0.04, -0.05, 0.01, 0.03, -0.02};
+        double v_dr[3] = {0.13, -0.27, 0.05}, v_b = 0.31;
+        D ai[10], aj[10];
+        for (int k = 0; k < 10; ++k) { ai[k] = D(m_i[k], v_ai[k]); aj[k] = D(m_j[k], v_aj[k]); }
+        D e5, gai5[10], gaj5[10], gdr5[3], gb5;
+        slater_pauli_pair_full<D>(ai, aj, D(dr[0], v_dr[0]), D(dr[1], v_dr[1]), D(dr[2], v_dr[2]), D(b_ij, v_b), e5, gai5, gaj5, gdr5, gb5);
+        printf("pauli_hvp_e 0 %.17e\n", e5.d);
+        for (int k = 0; k < 10; ++k) printf("pauli_hvp_ai %d %.17e\n", k, gai5[k].d);
+        for (int k = 0; k < 10; ++k) printf("pauli_hvp_aj %d %.17e\n", k, gaj5[k].d);
+        for (int k = 0; k < 3; ++k) printf("pauli_hvp_dr %d %.17e\n", k, gdr5[k].d);
+        printf("pauli_hvp_b 0 %.17e\n", gb5.d);
+    }
     return 0;
 }

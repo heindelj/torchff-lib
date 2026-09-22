@@ -6,6 +6,9 @@
 #define __forceinline__ inline
 #include <cmath>
 #include <cstdio>
+// dual.cuh routes rsqrt to the CUDA intrinsics, which libm does not have
+static inline float rsqrtf(float x) { return 1.0f / sqrtf(x); }
+static inline double rsqrt(double x) { return 1.0 / sqrt(x); }
 #include "common/dual.cuh"
 #include "ffterms/terms.cuh"
 using D = Dual<double>;

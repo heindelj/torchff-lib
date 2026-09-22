@@ -115,6 +115,26 @@ def test_device_math_matches_torch(tmp_path):
     assert abs(hv[5][0].item() - out["hvp_bi"][0]) < 1e-12 * max(1.0, abs(hv[5][0].item()))
     assert abs(hv[5][1].item() - out["hvp_bj"][0]) < 1e-12 * max(1.0, abs(hv[5][1].item()))
 
+    # Pauli: the same pair as per-pair polytensors with one combined exponent
+    pl = [t.clone().requires_grad_(True) for t in (m_i, m_j, dr)]
+    pb = torch.tensor([2.1], dtype=DT, requires_grad=True)
+    pcoords = torch.stack([torch.zeros(3, dtype=DT), pl[2]])
+    ep = se.slater_pauli_pair_energy_ref(pcoords, torch.tensor([[0, 1]]), pb, pl[0][None], pl[1][None])[0]
+    assert abs(ep.item() - out["pauli_e"][0]) < 1e-13 * max(1.0, abs(ep.item()))
+    gp = torch.autograd.grad(ep, pl + [pb], create_graph=True)
+    for name, gt in zip(["pauli_gai", "pauli_gaj", "pauli_gdr", "pauli_gb"], gp):
+        for k in range(gt.numel()):
+            assert abs(gt[k].item() - out[name][k]) < 1e-12 * max(1.0, abs(gt[k].item())), (name, k)
+    vp = [torch.tensor(t, dtype=DT) for t in (
+        [0.7, -0.2, 0.4, 0.1, 0.05, -0.03, 0.02, 0.06, -0.01, 0.03],
+        [-0.3, 0.5, 0.1, -0.6, 0.02, 0.04, -0.05, 0.01, 0.03, -0.02], [0.13, -0.27, 0.05], [0.31])]
+    Lp = sum((gt * vt).sum() for gt, vt in zip(gp, vp))
+    hp = torch.autograd.grad(Lp, pl + [pb])
+    assert abs(Lp.item() - out["pauli_hvp_e"][0]) < 1e-13 * max(1.0, abs(Lp.item()))
+    for name, ht in zip(["pauli_hvp_ai", "pauli_hvp_aj", "pauli_hvp_dr", "pauli_hvp_b"], hp):
+        for k in range(ht.numel()):
+            assert abs(ht[k].item() - out[name][k]) < 1e-11 * max(1.0, abs(ht[k].item())), (name, k)
+
 
 # --- 3 ---------------------------------------------------------------------------------------
 
@@ -184,3 +204,44 @@ def test_field_kernel_and_its_vjp_match_ref(K):
     assert torch.autograd.gradcheck(
         lambda c, bb, gg, mm, nn: se.slater_elec_field(c, pairs, bb, gg, mm, nn, use_customized_ops=True),
         leaves, nondet_tol=1e-12)
+
+
+def _pauli_system(n_pairs=30, K=10, device="cpu", seed=0):
+    g = torch.Generator().manual_seed(seed)
+    n = 12
+    coords = (torch.rand(n, 3, generator=g, dtype=DT) * 4.0).to(device).requires_grad_(True)
+    ii, jj = torch.triu_indices(n, n, 1)
+    sel = torch.randperm(ii.numel(), generator=g)[:n_pairs]
+    pairs = torch.stack([ii[sel], jj[sel]], 1).to(device)
+    b = (torch.rand(n_pairs, generator=g, dtype=DT) + 1.5).to(device).requires_grad_(True)
+    a_i = (torch.randn(n_pairs, K, generator=g, dtype=DT) * 0.3).to(device).requires_grad_(True)
+    a_j = (torch.randn(n_pairs, K, generator=g, dtype=DT) * 0.3).to(device).requires_grad_(True)
+    return coords, pairs, b, a_i, a_j
+
+
+@needs_cuda
+@pytest.mark.parametrize("K", [1, 4, 10])
+def test_pauli_kernel_matches_ref_to_second_order(K):
+    args = _pauli_system(K=K, device="cuda")
+    coords, pairs, b, a_i, a_j = args
+    leaves = (coords, b, a_i, a_j)
+    ws = [torch.randn_like(t) for t in leaves]
+
+    def run(fn):
+        e = fn(*args)
+        w = torch.linspace(0.5, 1.5, e.numel(), dtype=e.dtype, device=e.device)
+        g = torch.autograd.grad((e * w).sum(), leaves, create_graph=True)
+        loss = sum((gk * gk * wk).sum() + (gk * wk).sum() for gk, wk in zip(g, ws))
+        h = torch.autograd.grad(loss, leaves)
+        return e.detach(), [x.detach() for x in g], [x.detach() for x in h]
+
+    e_r, g_r, h_r = run(se.slater_pauli_pair_energy_ref)
+    e_o, g_o, h_o = run(lambda *a: se.slater_pauli_pair_energy(*a, use_customized_ops=True))
+    assert torch.allclose(e_o, e_r, rtol=1e-12, atol=1e-15)
+    for x, y in zip(g_r, g_o):
+        assert torch.allclose(x, y, rtol=1e-10, atol=1e-13)
+    for x, y in zip(h_r, h_o):
+        assert torch.allclose(x, y, rtol=1e-9, atol=1e-12)
+    assert torch.autograd.gradgradcheck(
+        lambda c, bb, ai, aj: se.slater_pauli_pair_energy(c, pairs, bb, ai, aj, use_customized_ops=True),
+        leaves, nondet_tol=1e-11)

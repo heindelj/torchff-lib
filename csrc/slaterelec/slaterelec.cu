@@ -8,6 +8,10 @@
 //                            gradients w.r.t. its six inputs out (double backward)
 //   slater_elec_field        (coords, pairs, b, gate, m, n)         -> f (N, 10) = d(sum e)/dm
 //   slater_elec_field_vjp    (coords, pairs, b, gate, m, n, lam)    -> (d_coords, d_b, d_gate, d_m, d_n)
+//   slater_pauli_pair_energy (coords, pairs, b_ij, a_i, a_j)          -> e (P,)      Pauli repulsion,
+//   slater_pauli_pair_grad   (..., g)                                 -> (d_coords, d_b, d_ai, d_aj)
+//   slater_pauli_pair_hvp    (..., g, v_coords, v_b, v_ai, v_aj)      -> (o_coords, o_b, o_ai, o_aj, o_g)
+//                            with per-pair Pauli polytensors a_i, a_j (P, K) and exponent b_ij (P,)
 //
 // m, n are (N, K) polytensors with K in {1, 4, 10}; the kernels zero-pad to 10 and write
 // multipole gradients as (N, 10) -- the caller slices. Nothing is materialised per pair: the
@@ -197,6 +201,81 @@ __global__ void field_vjp_kernel(
     }
 }
 
+
+// ------------------------------------------------------------------------------------
+// Pauli repulsion: per-pair polytensors a_i, a_j (P, K) and combined exponent b_ij (P,).
+// Same three-op pattern as the energy above (energy / g-weighted gradient / HVP).
+// ------------------------------------------------------------------------------------
+template <typename S>
+__device__ __forceinline__ void load_pp(const S* __restrict__ src, int64_t p, int K, S* out) {
+    for (int k = 0; k < 10; ++k) out[k] = k < K ? src[p * K + k] : S(0);
+}
+
+template <typename S>
+__global__ void pauli_energy_kernel(
+    const S* __restrict__ coords, const int64_t* __restrict__ pairs, const S* __restrict__ b,
+    const S* __restrict__ a_i, const S* __restrict__ a_j, int K, int64_t P, S* __restrict__ e_out
+) {
+    for (int64_t p = blockIdx.x * (int64_t)BLOCK + threadIdx.x; p < P; p += (int64_t)gridDim.x * BLOCK) {
+        int64_t i = pairs[2 * p], j = pairs[2 * p + 1];
+        S ai[10], aj[10];
+        load_pp(a_i, p, K, ai); load_pp(a_j, p, K, aj);
+        S dx = coords[3 * j] - coords[3 * i], dy = coords[3 * j + 1] - coords[3 * i + 1], dz = coords[3 * j + 2] - coords[3 * i + 2];
+        S e, gai[10], gaj[10], gdr[3], gb;
+        slater_pauli_pair_full<S>(ai, aj, dx, dy, dz, b[p], e, gai, gaj, gdr, gb);
+        e_out[p] = e;
+    }
+}
+
+template <typename S>
+__global__ void pauli_grad_kernel(
+    const S* __restrict__ coords, const int64_t* __restrict__ pairs, const S* __restrict__ b,
+    const S* __restrict__ a_i, const S* __restrict__ a_j, int K, int64_t P, const S* __restrict__ g,
+    S* __restrict__ d_coords, S* __restrict__ d_b, S* __restrict__ d_ai, S* __restrict__ d_aj
+) {
+    for (int64_t p = blockIdx.x * (int64_t)BLOCK + threadIdx.x; p < P; p += (int64_t)gridDim.x * BLOCK) {
+        int64_t i = pairs[2 * p], j = pairs[2 * p + 1];
+        S ai[10], aj[10];
+        load_pp(a_i, p, K, ai); load_pp(a_j, p, K, aj);
+        S dx = coords[3 * j] - coords[3 * i], dy = coords[3 * j + 1] - coords[3 * i + 1], dz = coords[3 * j + 2] - coords[3 * i + 2];
+        S e, gai[10], gaj[10], gdr[3], gb;
+        slater_pauli_pair_full<S>(ai, aj, dx, dy, dz, b[p], e, gai, gaj, gdr, gb);
+        S w = g[p];
+        atomicAdd(d_coords + 3 * i, -w * gdr[0]); atomicAdd(d_coords + 3 * i + 1, -w * gdr[1]); atomicAdd(d_coords + 3 * i + 2, -w * gdr[2]);
+        atomicAdd(d_coords + 3 * j,  w * gdr[0]); atomicAdd(d_coords + 3 * j + 1,  w * gdr[1]); atomicAdd(d_coords + 3 * j + 2,  w * gdr[2]);
+        d_b[p] = w * gb;
+        for (int k = 0; k < 10; ++k) { d_ai[p * 10 + k] = w * gai[k]; d_aj[p * 10 + k] = w * gaj[k]; }
+    }
+}
+
+template <typename S>
+__global__ void pauli_hvp_kernel(
+    const S* __restrict__ coords, const int64_t* __restrict__ pairs, const S* __restrict__ b,
+    const S* __restrict__ a_i, const S* __restrict__ a_j, int K, int64_t P, const S* __restrict__ g,
+    const S* __restrict__ v_coords, const S* __restrict__ v_b, const S* __restrict__ v_ai, const S* __restrict__ v_aj,
+    S* __restrict__ o_coords, S* __restrict__ o_b, S* __restrict__ o_ai, S* __restrict__ o_aj, S* __restrict__ o_g
+) {
+    using D = Dual<S>;
+    for (int64_t p = blockIdx.x * (int64_t)BLOCK + threadIdx.x; p < P; p += (int64_t)gridDim.x * BLOCK) {
+        int64_t i = pairs[2 * p], j = pairs[2 * p + 1];
+        S ai_[10], aj_[10], vai[10], vaj[10];
+        load_pp(a_i, p, K, ai_); load_pp(a_j, p, K, aj_); load_pp(v_ai, p, K, vai); load_pp(v_aj, p, K, vaj);
+        D ai[10], aj[10];
+        for (int k = 0; k < 10; ++k) { ai[k] = D(ai_[k], vai[k]); aj[k] = D(aj_[k], vaj[k]); }
+        D dx(coords[3 * j] - coords[3 * i],         v_coords[3 * j] - v_coords[3 * i]);
+        D dy(coords[3 * j + 1] - coords[3 * i + 1], v_coords[3 * j + 1] - v_coords[3 * i + 1]);
+        D dz(coords[3 * j + 2] - coords[3 * i + 2], v_coords[3 * j + 2] - v_coords[3 * i + 2]);
+        D e, gai[10], gaj[10], gdr[3], gb;
+        slater_pauli_pair_full<D>(ai, aj, dx, dy, dz, D(b[p], v_b[p]), e, gai, gaj, gdr, gb);
+        S gp = g[p];
+        o_g[p] = e.d;                                    // v . dE/d*
+        atomicAdd(o_coords + 3 * i, -gp * gdr[0].d); atomicAdd(o_coords + 3 * i + 1, -gp * gdr[1].d); atomicAdd(o_coords + 3 * i + 2, -gp * gdr[2].d);
+        atomicAdd(o_coords + 3 * j,  gp * gdr[0].d); atomicAdd(o_coords + 3 * j + 1,  gp * gdr[1].d); atomicAdd(o_coords + 3 * j + 2,  gp * gdr[2].d);
+        o_b[p] = gp * gb.d;
+        for (int k = 0; k < 10; ++k) { o_ai[p * 10 + k] = gp * gai[k].d; o_aj[p * 10 + k] = gp * gaj[k].d; }
+    }
+}
+
 // ------------------------------------------------------------------------------------
 // host wrappers
 // ------------------------------------------------------------------------------------
@@ -322,6 +401,78 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> slater_el
     return {d_coords, d_b, d_gate, d_m, d_n};
 }
 
+
+#define CHECK_PP(a) TORCH_CHECK((a).dim() == 2 && ((a).size(1) == 1 || (a).size(1) == 4 || (a).size(1) == 10), #a " must be (P, 1|4|10)")
+
+at::Tensor slater_pauli_pair_energy_cuda(
+    const at::Tensor& coords, const at::Tensor& pairs, const at::Tensor& b,
+    const at::Tensor& a_i, const at::Tensor& a_j
+) {
+    const c10::cuda::CUDAGuard guard(coords.device());
+    CHECK_PP(a_i); CHECK_PP(a_j);
+    int64_t P = pairs.size(0);
+    int K = (int)a_i.size(1);
+    auto e = at::empty({P}, coords.options());
+    if (P == 0) return e;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "slater_pauli_pair_energy", [&] {
+        pauli_energy_kernel<scalar_t><<<grid_for(P), BLOCK, 0, stream>>>(
+            coords.data_ptr<scalar_t>(), pairs.data_ptr<int64_t>(), b.data_ptr<scalar_t>(),
+            a_i.data_ptr<scalar_t>(), a_j.data_ptr<scalar_t>(), K, P, e.data_ptr<scalar_t>());
+    });
+    return e;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> slater_pauli_pair_grad_cuda(
+    const at::Tensor& coords, const at::Tensor& pairs, const at::Tensor& b,
+    const at::Tensor& a_i, const at::Tensor& a_j, const at::Tensor& g
+) {
+    const c10::cuda::CUDAGuard guard(coords.device());
+    CHECK_PP(a_i); CHECK_PP(a_j);
+    int64_t P = pairs.size(0);
+    int K = (int)a_i.size(1);
+    auto d_coords = at::zeros_like(coords);
+    auto d_b = at::empty_like(b);
+    auto d_ai = at::empty({P, 10}, a_i.options());
+    auto d_aj = at::empty({P, 10}, a_j.options());
+    if (P == 0) return {d_coords, d_b, d_ai, d_aj};
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "slater_pauli_pair_grad", [&] {
+        pauli_grad_kernel<scalar_t><<<grid_for(P), BLOCK, 0, stream>>>(
+            coords.data_ptr<scalar_t>(), pairs.data_ptr<int64_t>(), b.data_ptr<scalar_t>(),
+            a_i.data_ptr<scalar_t>(), a_j.data_ptr<scalar_t>(), K, P, g.data_ptr<scalar_t>(),
+            d_coords.data_ptr<scalar_t>(), d_b.data_ptr<scalar_t>(), d_ai.data_ptr<scalar_t>(), d_aj.data_ptr<scalar_t>());
+    });
+    return {d_coords, d_b, d_ai, d_aj};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> slater_pauli_pair_hvp_cuda(
+    const at::Tensor& coords, const at::Tensor& pairs, const at::Tensor& b,
+    const at::Tensor& a_i, const at::Tensor& a_j, const at::Tensor& g,
+    const at::Tensor& v_coords, const at::Tensor& v_b, const at::Tensor& v_ai, const at::Tensor& v_aj
+) {
+    const c10::cuda::CUDAGuard guard(coords.device());
+    CHECK_PP(a_i); CHECK_PP(a_j); CHECK_PP(v_ai); CHECK_PP(v_aj);
+    TORCH_CHECK(v_ai.size(1) == a_i.size(1) && v_aj.size(1) == a_j.size(1), "v_ai / v_aj must have the same K as a_i / a_j");
+    int64_t P = pairs.size(0);
+    int K = (int)a_i.size(1);
+    auto o_coords = at::zeros_like(coords);
+    auto o_b = at::empty_like(b);
+    auto o_ai = at::empty({P, 10}, a_i.options());
+    auto o_aj = at::empty({P, 10}, a_j.options());
+    auto o_g = at::empty_like(g);
+    if (P == 0) return {o_coords, o_b, o_ai, o_aj, o_g};
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "slater_pauli_pair_hvp", [&] {
+        pauli_hvp_kernel<scalar_t><<<grid_for(P), BLOCK, 0, stream>>>(
+            coords.data_ptr<scalar_t>(), pairs.data_ptr<int64_t>(), b.data_ptr<scalar_t>(),
+            a_i.data_ptr<scalar_t>(), a_j.data_ptr<scalar_t>(), K, P, g.data_ptr<scalar_t>(),
+            v_coords.data_ptr<scalar_t>(), v_b.data_ptr<scalar_t>(), v_ai.data_ptr<scalar_t>(), v_aj.data_ptr<scalar_t>(),
+            o_coords.data_ptr<scalar_t>(), o_b.data_ptr<scalar_t>(), o_ai.data_ptr<scalar_t>(), o_aj.data_ptr<scalar_t>(), o_g.data_ptr<scalar_t>());
+    });
+    return {o_coords, o_b, o_ai, o_aj, o_g};
+}
+
 }  // namespace
 
 TORCH_LIBRARY_IMPL(torchff, CUDA, m) {
@@ -330,4 +481,7 @@ TORCH_LIBRARY_IMPL(torchff, CUDA, m) {
     m.impl("slater_elec_pair_hvp", slater_elec_pair_hvp_cuda);
     m.impl("slater_elec_field", slater_elec_field_cuda);
     m.impl("slater_elec_field_vjp", slater_elec_field_vjp_cuda);
+    m.impl("slater_pauli_pair_energy", slater_pauli_pair_energy_cuda);
+    m.impl("slater_pauli_pair_grad", slater_pauli_pair_grad_cuda);
+    m.impl("slater_pauli_pair_hvp", slater_pauli_pair_hvp_cuda);
 }

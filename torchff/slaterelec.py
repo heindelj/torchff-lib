@@ -14,6 +14,9 @@ Two ops, each with a pure-torch reference and a CUDA kernel:
   kernel (the ``ffterms`` Energy/Grad pattern: the backward of the gradient op is the
   Hessian-vector product, the gradient kernel instantiated on dual numbers), so a force loss
   can be trained through it.
+* :func:`slater_pauli_pair_energy` -- the Slater multipolar Pauli repulsion
+  ``a_j^T f_2c(b_ij r) T a_i`` on per-pair Pauli polytensors ``(P, K)`` with one combined
+  exponent per pair; the same Energy/Grad/HVP pattern.
 * :func:`slater_elec_field` -- ``dE/dm`` as ``(N, K)``: the matvec of a coupled polarization
   solve. Its backward is the exact VJP with respect to every input (a nested dual-number
   evaluation of the per-pair math), which is what an adjoint solve needs.
@@ -47,6 +50,8 @@ __all__ = [
     "slater_elec_pair_energy_ref",
     "slater_elec_field",
     "slater_elec_field_ref",
+    "slater_pauli_pair_energy",
+    "slater_pauli_pair_energy_ref",
 ]
 
 
@@ -408,3 +413,61 @@ def slater_elec_field(coords, pairs, b, gate, m, n, *, use_customized_ops=None):
     if _use_kernel(coords, use_customized_ops):
         return _Field.apply(*_prep(coords, pairs, b, gate, m, n))
     return slater_elec_field_ref(coords, pairs, b, gate, m, n)
+
+
+# ---------------------------------------------------------------------------------------
+# Pauli repulsion
+# ---------------------------------------------------------------------------------------
+
+def slater_pauli_pair_energy_ref(coords, pairs, b_ij, a_i, a_j) -> torch.Tensor:
+    """``(P,)`` reference: ``a_j^T [f_2c(b_ij r) T] a_i`` on per-pair polytensors."""
+    max_rank = _rank_of(a_i)
+    dr = coords[pairs[:, 1]] - coords[pairs[:, 0]]
+    r = dr.norm(dim=-1)
+    damp = slater_two_center_damp(b_ij * r, max_rank)
+    t = damped_interaction_tensor(dr, damp, 1.0 / r, max_rank=max_rank)
+    return multipole_pair_energy(a_i, a_j, t)
+
+
+class _PauliGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, coords, pairs, b, a_i, a_j, g):
+        K = a_i.shape[1]
+        d_coords, d_b, d_ai, d_aj = torch.ops.torchff.slater_pauli_pair_grad(coords, pairs, b, a_i, a_j, g)
+        ctx.save_for_backward(coords, pairs, b, a_i, a_j, g)
+        return d_coords, d_b, d_ai[:, :K].contiguous(), d_aj[:, :K].contiguous()
+
+    @staticmethod
+    def backward(ctx, v_coords, v_b, v_ai, v_aj):
+        coords, pairs, b, a_i, a_j, g = ctx.saved_tensors
+        K = a_i.shape[1]
+        v_coords = torch.zeros_like(coords) if v_coords is None else v_coords.contiguous()
+        v_b = torch.zeros_like(b) if v_b is None else v_b.contiguous()
+        v_ai = torch.zeros_like(a_i) if v_ai is None else v_ai.contiguous()
+        v_aj = torch.zeros_like(a_j) if v_aj is None else v_aj.contiguous()
+        o_coords, o_b, o_ai, o_aj, o_g = torch.ops.torchff.slater_pauli_pair_hvp(
+            coords, pairs, b, a_i, a_j, g, v_coords, v_b, v_ai, v_aj
+        )
+        return o_coords, None, o_b, o_ai[:, :K], o_aj[:, :K], o_g
+
+
+class _Pauli(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, coords, pairs, b, a_i, a_j):
+        ctx.save_for_backward(coords, pairs, b, a_i, a_j)
+        return torch.ops.torchff.slater_pauli_pair_energy(coords, pairs, b, a_i, a_j)
+
+    @staticmethod
+    def backward(ctx, g):
+        coords, pairs, b, a_i, a_j = ctx.saved_tensors
+        d_coords, d_b, d_ai, d_aj = _PauliGrad.apply(coords, pairs, b, a_i, a_j, g.contiguous())
+        return d_coords, None, d_b, d_ai, d_aj
+
+
+def slater_pauli_pair_energy(coords, pairs, b_ij, a_i, a_j, *, use_customized_ops=None):
+    """``(P,)`` Slater multipolar Pauli energies; ``a_i``/``a_j`` are ``(P, K)`` per-pair Pauli
+    polytensors and ``b_ij`` the ``(P,)`` combined exponent. Double backward on CUDA."""
+    if _use_kernel(coords, use_customized_ops):
+        return _Pauli.apply(coords.contiguous(), pairs.contiguous(), b_ij.contiguous(),
+                            a_i.contiguous(), a_j.contiguous())
+    return slater_pauli_pair_energy_ref(coords, pairs, b_ij, a_i, a_j)

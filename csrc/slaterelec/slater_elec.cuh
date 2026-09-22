@@ -193,4 +193,35 @@ __device__ __forceinline__ void slater_elec_pair_field(
     mp_term<S>(n_i, s_j, drx, dry, drz, d, S(1), e, junk_i, g_mj, gdr);
 }
 
+// ---------------------------------------------------------------------------------------
+// Slater multipolar Pauli repulsion (rsfff.ff.pauli.slater_pauli_pair_energy):
+//
+//   E_ij = a_j^T [ f_2c(b_ij r) T ] a_i
+//
+// with a the *Pauli* polytensors (emitted directly, already gathered onto the pair) and one
+// combined exponent b_ij per pair. Same damping family as the shell-shell term above, with
+// the overlap complement's sign flipped: the Pauli energy is +f T, the penetration is -f T.
+// Outputs: e; g_ai, g_aj = dE/da; gdr = dE/d(dr); g_b = dE/db_ij (from a Dual pass in u).
+// ---------------------------------------------------------------------------------------
+template <typename S>
+__device__ __forceinline__ void slater_pauli_pair_full(
+    const S* a_i, const S* a_j, S drx, S dry, S drz, S b_ij,
+    S& e, S* g_ai, S* g_aj, S* gdr, S& g_b
+) {
+    using D = Dual<S>;
+    S r = d_sqrt(drx * drx + dry * dry + drz * drz);
+    D ai[10], aj[10];
+    for (int k = 0; k < 10; ++k) { ai[k] = D(a_i[k]); aj[k] = D(a_j[k]); }
+    D d[6];
+    two_center_damps<D, S>(D(b_ij * r, S(1)), d);        // tangent = d/du
+    D ee(S(0)), gi[10], gj[10], gd[3];
+    for (int k = 0; k < 10; ++k) { gi[k] = D(S(0)); gj[k] = D(S(0)); }
+    gd[0] = gd[1] = gd[2] = D(S(0));
+    mp_term<D>(ai, aj, D(drx), D(dry), D(drz), d, D(S(1)), ee, gi, gj, gd);
+    e = ee.v;
+    for (int k = 0; k < 10; ++k) { g_ai[k] = gi[k].v; g_aj[k] = gj[k].v; }
+    gdr[0] = gd[0].v; gdr[1] = gd[1].v; gdr[2] = gd[2].v;
+    g_b = ee.d * r;                                      // u = b_ij r
+}
+
 #endif /* TORCHFF_SLATER_ELEC_CUH */

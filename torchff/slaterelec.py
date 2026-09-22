@@ -40,6 +40,60 @@ try:
 except ImportError:
     HAVE_KERNELS = False
 
+
+def _register_fakes():
+    """Shape-only ("fake") implementations, so ``torch.compile`` can trace through the ops.
+
+    Dynamo needs to know every op's output shapes without running it; without these it
+    graph-breaks at each kernel call and the surrounding code cannot be fused.
+    """
+    lib = torch.library
+
+    @lib.register_fake("torchff::slater_elec_pair_energy")
+    def _(coords, pairs, b, gate, m, n):
+        return coords.new_empty(pairs.shape[0])
+
+    @lib.register_fake("torchff::slater_elec_pair_grad")
+    def _(coords, pairs, b, gate, m, n, g):
+        return (torch.empty_like(coords), torch.empty_like(b), torch.empty_like(gate),
+                m.new_empty(m.shape[0], 10), n.new_empty(n.shape[0], 10))
+
+    @lib.register_fake("torchff::slater_elec_pair_hvp")
+    def _(coords, pairs, b, gate, m, n, g, v_coords, v_b, v_gate, v_m, v_n):
+        return (torch.empty_like(coords), torch.empty_like(b), torch.empty_like(gate),
+                m.new_empty(m.shape[0], 10), n.new_empty(n.shape[0], 10), torch.empty_like(g))
+
+    @lib.register_fake("torchff::slater_elec_field")
+    def _(coords, pairs, b, gate, m, n):
+        return m.new_empty(m.shape[0], 10)
+
+    @lib.register_fake("torchff::slater_elec_field_vjp")
+    def _(coords, pairs, b, gate, m, n, lam):
+        return (torch.empty_like(coords), torch.empty_like(b), torch.empty_like(gate),
+                m.new_empty(m.shape[0], 10), n.new_empty(n.shape[0], 10))
+
+    @lib.register_fake("torchff::slater_pauli_pair_energy")
+    def _(coords, pairs, b, a_i, a_j):
+        return coords.new_empty(pairs.shape[0])
+
+    @lib.register_fake("torchff::slater_pauli_pair_grad")
+    def _(coords, pairs, b, a_i, a_j, g):
+        P = pairs.shape[0]
+        return (torch.empty_like(coords), torch.empty_like(b), a_i.new_empty(P, 10), a_j.new_empty(P, 10))
+
+    @lib.register_fake("torchff::slater_pauli_pair_hvp")
+    def _(coords, pairs, b, a_i, a_j, g, v_coords, v_b, v_ai, v_aj):
+        P = pairs.shape[0]
+        return (torch.empty_like(coords), torch.empty_like(b), a_i.new_empty(P, 10), a_j.new_empty(P, 10),
+                torch.empty_like(g))
+
+
+if HAVE_KERNELS:
+    try:
+        _register_fakes()
+    except Exception:  # an older torch without register_fake: compile just graph-breaks here
+        pass
+
 __all__ = [
     "HAVE_KERNELS",
     "slater_two_center_damp",

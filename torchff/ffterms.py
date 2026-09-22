@@ -47,6 +47,55 @@ try:  # registers torch.ops.torchff.*_pair_energy / _grad / _hvp
 except ImportError:  # CPU-only install (TORCHFF_NO_CUDA=1)
     HAVE_KERNELS = False
 
+
+def _register_fakes():
+    """Shape-only implementations so ``torch.compile`` can trace through the ops."""
+    lib = torch.library
+
+    @lib.register_fake("torchff::tt_dispersion_pair_energy")
+    def _(coords, pairs, c6, b):
+        return coords.new_empty(pairs.shape[0])
+
+    @lib.register_fake("torchff::tt_dispersion_pair_grad")
+    def _(coords, pairs, c6, b, g):
+        return torch.empty_like(coords), torch.empty_like(c6), torch.empty_like(b)
+
+    @lib.register_fake("torchff::tt_dispersion_pair_hvp")
+    def _(coords, pairs, c6, b, g, v_coords, v_c6, v_b):
+        return torch.empty_like(coords), torch.empty_like(c6), torch.empty_like(b), torch.empty_like(g)
+
+    @lib.register_fake("torchff::morse_bond_energy")
+    def _(coords, bonds, r_eq, d, k):
+        return coords.new_empty(bonds.shape[0])
+
+    @lib.register_fake("torchff::morse_bond_grad")
+    def _(coords, bonds, r_eq, d, k, g):
+        return torch.empty_like(coords), torch.empty_like(r_eq), torch.empty_like(d), torch.empty_like(k)
+
+    @lib.register_fake("torchff::morse_bond_hvp")
+    def _(coords, bonds, r_eq, d, k, g, v_coords, v_req, v_d, v_k):
+        return (torch.empty_like(coords), torch.empty_like(r_eq), torch.empty_like(d), torch.empty_like(k),
+                torch.empty_like(g))
+
+    @lib.register_fake("torchff::cosine_angle_energy")
+    def _(coords, angles, cos_eq, k):
+        return coords.new_empty(angles.shape[0])
+
+    @lib.register_fake("torchff::cosine_angle_grad")
+    def _(coords, angles, cos_eq, k, g):
+        return torch.empty_like(coords), torch.empty_like(cos_eq), torch.empty_like(k)
+
+    @lib.register_fake("torchff::cosine_angle_hvp")
+    def _(coords, angles, cos_eq, k, g, v_coords, v_cos, v_k):
+        return torch.empty_like(coords), torch.empty_like(cos_eq), torch.empty_like(k), torch.empty_like(g)
+
+
+if HAVE_KERNELS:
+    try:
+        _register_fakes()
+    except Exception:
+        pass
+
 __all__ = [
     "HAVE_KERNELS",
     "tang_toennies",

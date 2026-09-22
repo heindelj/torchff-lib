@@ -66,7 +66,11 @@ def test_refs_match_legacy_torchff_formulas():
         pytest.skip("torchff.dispersion needs the compiled extension")
     legacy = compute_tang_tonnies_dispersion_energy_ref(r, s["c6"], s["b"], sum=False)
     mine = ffterms.tt_dispersion_pair_energy_ref(s["coords"], s["pairs"], s["c6"], s["b"])
-    assert torch.allclose(mine, legacy, rtol=1e-10, atol=1e-14)
+    # The legacy formula is the direct form everywhere; below u = 2 it cancels catastrophically
+    # (that is what the series branch is for), so only the direct region is a fair comparison.
+    direct = (s["b"] * r).detach() >= ffterms.TT_SERIES_BELOW
+    assert direct.sum() > 0
+    assert torch.allclose(mine[direct], legacy[direct], rtol=1e-10, atol=1e-14)
 
 
 def test_morse_ref_is_well_referenced():
@@ -183,8 +187,10 @@ def test_kernel_matches_ref_to_second_order(term):
     for a, b_ in zip(h_ref, h_op):
         assert torch.allclose(a, b_, rtol=1e-9, atol=1e-12)
 
-    assert torch.autograd.gradcheck(op, args)
-    assert torch.autograd.gradgradcheck(op, args)
+    # The coordinate gradient is scattered with atomicAdd, whose summation order is not
+    # deterministic, hence a nonzero nondet_tol: run-to-run differences of ~1e-16 are expected.
+    assert torch.autograd.gradcheck(op, args, nondet_tol=1e-12)
+    assert torch.autograd.gradgradcheck(op, args, nondet_tol=1e-12)
 
 
 @needs_cuda

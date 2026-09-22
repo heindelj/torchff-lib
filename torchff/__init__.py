@@ -21,6 +21,6 @@ for _name in (
     globals().update({n: getattr(_mod, n) for n in _public})
     __all__.extend(_public)
 
-from . import ffterms  # noqa: E402  -- always importable; kernels optional
+from . import ffterms, slaterelec  # noqa: E402  -- always importable; kernels optional
 
-__all__.append("ffterms")
+__all__.extend(["ffterms", "slaterelec"])

@@ -49,6 +49,15 @@ template <typename T> __device__ __forceinline__ Dual<T> operator*(T a, const Du
 template <typename T> __device__ __forceinline__ Dual<T> operator/(const Dual<T>& a, T b) { T inv = T(1) / b; return Dual<T>(a.v * inv, a.d * inv); }
 template <typename T> __device__ __forceinline__ Dual<T> operator/(T a, const Dual<T>& b) { T inv = T(1) / b.v; return Dual<T>(a * inv, -a * b.d * inv * inv); }
 
+// ---- integer literals (the multipole tensor code is written as `3 * x2 * drinv5 - drinv3`) ---
+template <typename T> __device__ __forceinline__ Dual<T> operator*(int a, const Dual<T>& b) { return Dual<T>(T(a) * b.v, T(a) * b.d); }
+template <typename T> __device__ __forceinline__ Dual<T> operator*(const Dual<T>& a, int b) { return Dual<T>(a.v * T(b), a.d * T(b)); }
+template <typename T> __device__ __forceinline__ Dual<T> operator/(const Dual<T>& a, int b) { T inv = T(1) / T(b); return Dual<T>(a.v * inv, a.d * inv); }
+template <typename T> __device__ __forceinline__ Dual<T> operator+(const Dual<T>& a, int b) { return Dual<T>(a.v + T(b), a.d); }
+template <typename T> __device__ __forceinline__ Dual<T> operator+(int a, const Dual<T>& b) { return Dual<T>(T(a) + b.v, b.d); }
+template <typename T> __device__ __forceinline__ Dual<T> operator-(const Dual<T>& a, int b) { return Dual<T>(a.v - T(b), a.d); }
+template <typename T> __device__ __forceinline__ Dual<T> operator-(int a, const Dual<T>& b) { return Dual<T>(T(a) - b.v, -b.d); }
+
 // ---- comparisons act on the primal (branch selection) -------------------------------------
 template <typename T> __device__ __forceinline__ bool operator<(const Dual<T>& a, T b) { return a.v < b; }
 template <typename T> __device__ __forceinline__ bool operator>(const Dual<T>& a, T b) { return a.v > b; }
@@ -66,6 +75,12 @@ template <typename T> __device__ __forceinline__ Dual<T> d_exp(const Dual<T>& x)
 template <typename T> __device__ __forceinline__ Dual<T> d_sqrt(const Dual<T>& x) {
     T s = d_sqrt(x.v);
     return Dual<T>(s, x.d / (T(2) * s));
+}
+__device__ __forceinline__ float  d_rsqrt(float x)  { return ::rsqrtf(x); }
+__device__ __forceinline__ double d_rsqrt(double x) { return ::rsqrt(x); }
+template <typename T> __device__ __forceinline__ Dual<T> d_rsqrt(const Dual<T>& x) {
+    T r = d_rsqrt(x.v);
+    return Dual<T>(r, T(-0.5) * r * r * r * x.d);
 }
 
 // primal(x): the value part, for branch decisions and for reading results back
